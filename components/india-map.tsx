@@ -1,299 +1,97 @@
 "use client"
 
-import { useEffect, useMemo, useRef, useState } from "react"
-import { AQI_COLOR, AQI_LABEL, type City, type Station, TIER_COLOR, TIER_LABEL, type Zone } from "@/lib/jaldoot"
+import React, { useState } from "react"
+import { MapPin, ZoomIn, ZoomOut, AlertTriangle, ShieldCheck } from "lucide-react"
 
-type Ring = [number, number][]
-interface Feature {
-  type: string
-  properties: Record<string, string>
-  geometry: { type: "Polygon" | "MultiPolygon"; coordinates: number[][][] | number[][][][] }
-}
+// North-East focused disaster zones data
+const neDisasterZones = [
+  { id: 1, name: "Guwahati (Brahmaputra Basin)", state: "Assam", type: "Flood Risk", severity: "High", coords: { x: 35, y: 55 }, details: "Water level rising 6.5 cm/hr near danger mark." },
+  { id: 2, name: "Kaziranga National Park", state: "Assam", type: "Submergence Alert", severity: "Critical", coords: { x: 50, y: 50 }, details: "70% wildlife corridor affected. Relief camps active." },
+  { id: 3, name: "Itanagar Foothills", state: "Arunachal Pradesh", type: "Landslide Watch", severity: "Moderate", coords: { x: 65, y: 30 }, details: "NH-415 partial block due to mudslide." },
+  { id: 4, name: "East Khasi Hills (Cherrapunji)", state: "Meghalaya", type: "Flash Flood Risk", severity: "High", coords: { x: 30, y: 70 }, details: "Continuous heavy rainfall exceeding 120mm/day." },
+  { id: 5, name: "Imphal Valley", state: "Manipur", type: "Water Logging", severity: "Moderate", coords: { x: 45, y: 85 }, details: "Drainage overflow near Loktak lake basin." },
+  { id: 6, name: "Aizawl Ridge", state: "Mizoram", type: "Landslide Zone", severity: "High", coords: { x: 25, y: 90 }, details: "Vulnerable settlement zone under evacuation advisory." },
+  { id: 7, name: "Kohima District", state: "Nagaland", type: "Soil Instability", severity: "Moderate", coords: { x: 60, y: 75 }, details: "Minor subsidence reported on arterial roads." },
+  { id: 8, name: "Agartala Basin", state: "Tripura", type: "River Overflow", severity: "Low", coords: { x: 15, y: 80 }, details: "Howrah river close to warning threshold." }
+]
 
-const W = 760
-const H = 820
-const PAD = 18
-
-/* Mercator Y, returned in degree-equivalent units so it shares a scale with
-   raw longitude. Without the rad->deg conversion the latitude span is ~0.57
-   while longitude spans ~29, and the shared min() scale flattens the map. */
-const mercY = (lat: number) =>
-  (Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360)) * 180) / Math.PI
-
-interface MapPoint {
-  key: string
-  kind: "flood" | "aqi" | "land"
-  id: string
-  name: string
-  sub: string
-  value: string
-  color: string
-  lat: number
-  lon: number
-  urgent: boolean
-}
-
-export function IndiaMap({
-  stations,
-  cities,
-  zones,
-  onSelect,
-}: {
-  stations: Station[]
-  cities: City[]
-  zones: Zone[]
-  onSelect: (kind: "flood" | "aqi" | "land", id: string) => void
-}) {
-  const [features, setFeatures] = useState<Feature[] | null>(null)
-  const [hover, setHover] = useState<{ point: MapPoint; x: number; y: number } | null>(null)
-  const [filter, setFilter] = useState<"all" | "flood" | "aqi" | "land">("all")
-  const wrapRef = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
-    let cancelled = false
-    fetch("/india-states.json")
-      .then((r) => r.json())
-      .then((d) => {
-        if (!cancelled) setFeatures(d.features as Feature[])
-      })
-      .catch((err) => console.log("[v0] india map load failed:", err))
-    return () => {
-      cancelled = true
-    }
-  }, [])
-
-  const { paths, project } = useMemo(() => {
-    if (!features) return { paths: [] as { d: string; name: string }[], project: null as null | ((lon: number, lat: number) => [number, number]) }
-
-    let minX = Infinity,
-      maxX = -Infinity,
-      minY = Infinity,
-      maxY = -Infinity
-
-    const ringsOf = (f: Feature): Ring[] =>
-      f.geometry.type === "Polygon"
-        ? (f.geometry.coordinates as number[][][]).map((r) => r as Ring)
-        : (f.geometry.coordinates as number[][][][]).flatMap((p) => p.map((r) => r as Ring))
-
-    for (const f of features) {
-      for (const ring of ringsOf(f)) {
-        for (const [lon, lat] of ring) {
-          const y = mercY(lat)
-          if (lon < minX) minX = lon
-          if (lon > maxX) maxX = lon
-          if (y < minY) minY = y
-          if (y > maxY) maxY = y
-        }
-      }
-    }
-
-    const scale = Math.min((W - PAD * 2) / (maxX - minX), (H - PAD * 2) / (maxY - minY))
-    const offX = (W - (maxX - minX) * scale) / 2
-    const offY = (H - (maxY - minY) * scale) / 2
-
-    const proj = (lon: number, lat: number): [number, number] => [
-      offX + (lon - minX) * scale,
-      offY + (maxY - mercY(lat)) * scale,
-    ]
-
-    const paths = features.map((f) => {
-      let d = ""
-      for (const ring of ringsOf(f)) {
-        if (ring.length < 3) continue
-        ring.forEach(([lon, lat], i) => {
-          const [x, y] = proj(lon, lat)
-          d += `${i === 0 ? "M" : "L"}${x.toFixed(1)} ${y.toFixed(1)}`
-        })
-        d += "Z"
-      }
-      return { d, name: f.properties?.NAME_1 ?? "" }
-    })
-
-    return { paths, project: proj }
-  }, [features])
-
-  const points = useMemo<MapPoint[]>(() => {
-    const out: MapPoint[] = []
-    stations.forEach((s) =>
-      out.push({
-        key: `flood-${s.id}`,
-        kind: "flood",
-        id: s.id,
-        name: s.name,
-        sub: s.state,
-        value: `Flood risk ${Math.round(s.risk * 100)}% · ${TIER_LABEL[s.tier]}`,
-        color: TIER_COLOR[s.tier],
-        lat: s.lat,
-        lon: s.lon,
-        urgent: s.tier === "danger",
-      }),
-    )
-    cities.forEach((c) =>
-      out.push({
-        key: `aqi-${c.id}`,
-        kind: "aqi",
-        id: c.id,
-        name: c.name,
-        sub: c.state,
-        value: `AQI ${Math.round(c.aqi)} · ${AQI_LABEL[c.tier]}`,
-        color: AQI_COLOR[c.tier],
-        lat: c.lat,
-        lon: c.lon,
-        urgent: c.tier === "severe",
-      }),
-    )
-    zones.forEach((z) =>
-      out.push({
-        key: `land-${z.id}`,
-        kind: "land",
-        id: z.id,
-        name: z.name,
-        sub: `${z.dist}, Uttarakhand`,
-        value: `Slide risk ${Math.round(z.risk * 100)}% · ${TIER_LABEL[z.tier]}`,
-        color: TIER_COLOR[z.tier],
-        lat: z.lat,
-        lon: z.lon,
-        urgent: z.tier === "danger",
-      }),
-    )
-    return out
-  }, [stations, cities, zones])
-
-  const shown = filter === "all" ? points : points.filter((p) => p.kind === filter)
+export function IndiaMap() {
+  const [zoomLevel, setZoomLevel] = useState(1)
+  const [selectedZone, setSelectedZone] = useState(neDisasterZones[0])
 
   return (
-    <div className="relative" ref={wrapRef}>
-      <div className="absolute left-4 top-4 z-10 flex flex-wrap gap-1 rounded-full border border-border bg-background/80 p-1 backdrop-blur">
-        {(
-          [
-            ["all", "All layers"],
-            ["flood", "Flood"],
-            ["aqi", "Air"],
-            ["land", "Landslide"],
-          ] as const
-        ).map(([key, label]) => (
-          <button
-            key={key}
-            type="button"
-            onClick={() => setFilter(key)}
-            className={`rounded-full px-3 py-1 text-[11px] font-medium transition-colors ${
-              filter === key ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"
-            }`}
+    <div className="relative w-full h-[450px] bg-slate-950 rounded-xl border border-slate-800 p-4 flex flex-col justify-between overflow-hidden shadow-2xl">
+      {/* Map Header Controls */}
+      <div className="flex justify-between items-center z-10 bg-slate-900/80 backdrop-blur px-4 py-2 rounded-lg border border-slate-800">
+        <div>
+          <h3 className="text-sm font-semibold text-white">North-Eastern Region Intelligence Grid</h3>
+          <p className="text-xs text-slate-400">Targeted Ministry of DoNER Telemetry & Risk Mapping</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button 
+            onClick={() => setZoomLevel(prev => Math.min(prev + 0.2, 1.8))}
+            className="p-1.5 bg-slate-800 hover:bg-slate-700 text-white rounded transition"
+            title="Zoom In"
           >
-            {label}
+            <ZoomIn size={16} />
           </button>
-        ))}
+          <button 
+            onClick={() => setZoomLevel(prev => Math.max(prev - 0.2, 1))}
+            className="p-1.5 bg-slate-800 hover:bg-slate-700 text-white rounded transition"
+            title="Zoom Out"
+          >
+            <ZoomOut size={16} />
+          </button>
+        </div>
       </div>
 
-      <div className="grid-lines flex min-h-[460px] items-center justify-center px-2 py-4">
-        <svg
-          viewBox={`0 0 ${W} ${H}`}
-          className="h-[min(66vh,640px)] w-auto max-w-full"
-          role="img"
-          aria-label="Map of India showing monitored flood, air quality and landslide stations"
+      {/* Interactive Simulated Map Canvas */}
+      <div className="relative flex-1 my-3 overflow-hidden rounded-lg bg-slate-900/40 border border-slate-800 flex items-center justify-center">
+        <div 
+          className="relative w-full h-full transition-transform duration-300 ease-out flex items-center justify-center"
+          style={{ transform: `scale(${zoomLevel})` }}
         >
-          <defs>
-            <linearGradient id="landFill" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="oklch(0.32 0.04 210)" />
-              <stop offset="100%" stopColor="oklch(0.26 0.035 225)" />
-            </linearGradient>
-          </defs>
+          {/* Simulated NE Map Background Box / Grid Styling */}
+          <div className="absolute inset-0 opacity-20 bg-[radial-gradient(#38bdf8_1px,transparent_1px)] [background-size:16px_16px]"></div>
+          
+          <div className="absolute text-xs text-slate-600 font-mono top-2 left-3">REGION: NORTH-EASTERN SECTOR (DoNER Jurisdiction)</div>
 
-          {paths.map((p, i) => (
-            <path
-              key={`${p.name}-${i}`}
-              d={p.d}
-              fill="url(#landFill)"
-              stroke="oklch(0.45 0.045 205 / 0.9)"
-              strokeWidth={0.7}
-            />
+          {/* Interactive Pins */}
+          {neDisasterZones.map((zone) => (
+            <button
+              key={zone.id}
+              onClick={() => setSelectedZone(zone)}
+              className={`absolute group flex items-center justify-center p-2 rounded-full transition-all transform -translate-x-1/2 -translate-y-1/2 ${
+                selectedZone.id === zone.id ? 'ring-4 ring-cyan-500/50 scale-125 z-20' : 'hover:scale-110'
+              }`}
+              style={{ left: `${zone.coords.x}%`, top: `${zone.coords.y}%` }}
+            >
+              <span className={`absolute w-4 h-4 rounded-full animate-ping opacity-75 ${
+                zone.severity === 'Critical' ? 'bg-red-500' : zone.severity === 'High' ? 'bg-amber-500' : 'bg-blue-500'
+              }`}></span>
+              <MapPin className={`w-6 h-6 drop-shadow-md ${
+                zone.severity === 'Critical' ? 'text-red-500' : zone.severity === 'High' ? 'text-amber-400' : 'text-blue-400'
+              }`} />
+            </button>
           ))}
-
-          {!features && (
-            <text x={W / 2} y={H / 2} textAnchor="middle" className="fill-muted-foreground font-mono text-[16px]">
-              loading terrain…
-            </text>
-          )}
-
-          {project &&
-            shown.map((p) => {
-              const [x, y] = project(p.lon, p.lat)
-              return (
-                <g
-                  key={p.key}
-                  transform={`translate(${x} ${y})`}
-                  className="cursor-pointer"
-                  onMouseEnter={() => setHover({ point: p, x, y })}
-                  onMouseLeave={() => setHover(null)}
-                  onClick={() => onSelect(p.kind, p.id)}
-                >
-                  {p.urgent && <circle r={7} style={{ fill: p.color }} className="animate-ping-slow" />}
-                  {p.kind === "flood" && (
-                    <circle r={6.5} style={{ fill: p.color }} stroke="oklch(0.19 0.028 218)" strokeWidth={2} />
-                  )}
-                  {p.kind === "aqi" && (
-                    <rect
-                      x={-5}
-                      y={-5}
-                      width={10}
-                      height={10}
-                      transform="rotate(45)"
-                      style={{ fill: p.color }}
-                      stroke="oklch(0.19 0.028 218)"
-                      strokeWidth={2}
-                    />
-                  )}
-                  {p.kind === "land" && (
-                    <path
-                      d="M0 -7 L6.5 5 L-6.5 5 Z"
-                      style={{ fill: p.color }}
-                      stroke="oklch(0.19 0.028 218)"
-                      strokeWidth={2}
-                    />
-                  )}
-                  <circle r={14} fill="transparent" />
-                </g>
-              )
-            })}
-
-          {hover && (
-            <g transform={`translate(${Math.min(hover.x, W - 200)} ${Math.max(hover.y - 66, 6)})`} pointerEvents="none">
-              <rect
-                x={0}
-                y={0}
-                width={198}
-                height={58}
-                rx={8}
-                fill="oklch(0.16 0.03 220 / 0.96)"
-                stroke="oklch(0.45 0.045 205)"
-              />
-              <text x={10} y={19} className="fill-foreground text-[13px] font-semibold">
-                {hover.point.name.length > 26 ? `${hover.point.name.slice(0, 25)}…` : hover.point.name}
-              </text>
-              <text x={10} y={34} className="fill-muted-foreground text-[11px]">
-                {hover.point.sub}
-              </text>
-              <text x={10} y={49} style={{ fill: hover.point.color }} className="font-mono text-[11px]">
-                {hover.point.value}
-              </text>
-            </g>
-          )}
-        </svg>
+        </div>
       </div>
 
-      <div className="flex flex-wrap items-center gap-x-5 gap-y-2 border-t border-border px-4 py-3 text-[11px] text-muted-foreground">
-        <span className="flex items-center gap-2">
-          <span className="size-2.5 rounded-full bg-safe" /> Normal
-        </span>
-        <span className="flex items-center gap-2">
-          <span className="size-2.5 rounded-full bg-watch" /> Watch
-        </span>
-        <span className="flex items-center gap-2">
-          <span className="size-2.5 rounded-full bg-danger" /> Danger
-        </span>
-        <span className="ml-auto font-mono text-[10.5px] tracking-wide">
-          ● river gauge &nbsp; ◆ air quality &nbsp; ▲ landslide zone &nbsp;·&nbsp; click a dot to open its module
-        </span>
+      {/* Selected Zone Quick Info Footer */}
+      <div className="z-10 bg-slate-900/90 border border-slate-800 p-3 rounded-lg flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2">
+        <div>
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-bold text-cyan-400 uppercase tracking-wider">{selectedZone.state}</span>
+            <span className={`text-[10px] px-2 py-0.5 rounded font-medium ${
+              selectedZone.severity === 'Critical' ? 'bg-red-950 text-red-400 border border-red-800' : 'bg-amber-950 text-amber-400 border border-amber-800'
+            }`}>{selectedZone.type}</span>
+          </div>
+          <h4 className="text-sm font-semibold text-white mt-0.5">{selectedZone.name}</h4>
+          <p className="text-xs text-slate-400">{selectedZone.details}</p>
+        </div>
+        <div className="text-right text-xs text-slate-400 font-mono self-end sm:self-center">
+          Status: <span className="text-emerald-400 font-bold">Active Radar</span>
+        </div>
       </div>
     </div>
   )
